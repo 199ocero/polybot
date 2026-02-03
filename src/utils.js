@@ -58,7 +58,8 @@ export function appendCsvRow(filePath, header, row) {
     .join(",");
 
   if (!exists) {
-    fs.writeFileSync(filePath, `${header.join(",")}\n${line}\n`, "utf8");
+    const content = line ? `${header.join(",")}\n${line}\n` : `${header.join(",")}\n`;
+    fs.writeFileSync(filePath, content, "utf8");
     return;
   }
 

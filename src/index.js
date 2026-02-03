@@ -25,6 +25,7 @@ import fs from "node:fs";
 import path from "node:path";
 import readline from "node:readline";
 import { applyGlobalProxyFromEnv } from "./net/proxy.js";
+import { PaperTrader } from "./engines/paperTrader.js";
 
 function countVwapCrosses(closes, vwapSeries, lookback) {
   if (closes.length < lookback || vwapSeries.length < lookback) return null;
@@ -403,6 +404,8 @@ async function main() {
   let prevSpotPrice = null;
   let prevCurrentPrice = null;
   let priceToBeatState = { slug: null, value: null, setAtMs: null };
+  const signalState = { lastSide: null, lastTime: 0 };
+  const paper = new PaperTrader();
 
   const header = [
     "timestamp",
@@ -416,7 +419,11 @@ async function main() {
     "mkt_down",
     "edge_up",
     "edge_down",
-    "recommendation"
+    "recommendation",
+    "price_to_beat",
+    "current_price",
+    "binance_price",
+    "gap"
   ];
 
   while (true) {
@@ -445,6 +452,24 @@ async function main() {
         chainlinkPromise,
         fetchPolymarketSnapshot()
       ]);
+
+      // 0. CHECK FOR MANUAL STRIKE OVERRIDE
+      const strikeFile = "strike.txt";
+      if (fs.existsSync(strikeFile)) {
+        try {
+          const content = fs.readFileSync(strikeFile, "utf8").trim();
+          const overridePrice = parseFloat(content.replace(/,/g, ""));
+          // Validation: Must be number, positive, and vaguely realistic for BTC (e.g. > 1000) or 0-1 for others? 
+          // Assuming user knows what they are doing.
+          if (Number.isFinite(overridePrice) && overridePrice > 0) {
+              if (priceToBeatState.value !== overridePrice) {
+                 priceToBeatState = { slug: poly.market?.slug || "manual", value: overridePrice, setAtMs: Date.now() };
+              }
+          }
+        } catch (err) {
+            // ignore
+        }
+      }
 
       const settlementMs = poly.ok && poly.market?.endDate ? new Date(poly.market.endDate).getTime() : null;
       const settlementLeftMin = settlementMs ? (settlementMs - Date.now()) / 60_000 : null;
@@ -485,6 +510,35 @@ async function main() {
         ? closes[closes.length - 1] < vwapNow && closes[closes.length - 2] > vwapSeries[vwapSeries.length - 2]
         : false;
 
+      const lastCandle = klines1m.length ? klines1m[klines1m.length - 1] : null;
+      const lastClose = lastCandle?.close ?? null;
+      const close1mAgo = klines1m.length >= 2 ? klines1m[klines1m.length - 2]?.close ?? null : null;
+      const close3mAgo = klines1m.length >= 4 ? klines1m[klines1m.length - 4]?.close ?? null : null;
+      const delta1m = lastClose !== null && close1mAgo !== null ? lastClose - close1mAgo : null;
+      const delta3m = lastClose !== null && close3mAgo !== null ? lastClose - close3mAgo : null;
+
+      // New: Calculate Gap
+      const spotPrice = wsPrice ?? lastPrice;
+      const gap = (spotPrice !== null && lastPrice !== null) ? spotPrice - lastPrice : null;
+
+      const currentPrice = chainlink?.price ?? null;
+      const marketSlug = poly.ok ? String(poly.market?.slug ?? "") : "";
+      const marketStartMs = poly.ok && poly.market?.eventStartTime ? new Date(poly.market.eventStartTime).getTime() : null;
+
+      if (marketSlug && priceToBeatState.slug !== marketSlug) {
+        priceToBeatState = { slug: marketSlug, value: null, setAtMs: null };
+      }
+
+      if (priceToBeatState.slug && priceToBeatState.value === null && currentPrice !== null) {
+        const nowMs = Date.now();
+        const okToLatch = marketStartMs === null ? true : nowMs >= marketStartMs;
+        if (okToLatch) {
+          priceToBeatState = { slug: priceToBeatState.slug, value: Number(currentPrice), setAtMs: nowMs };
+        }
+      }
+
+      const priceToBeat = priceToBeatState.slug === marketSlug ? priceToBeatState.value : null;
+
       const regimeInfo = detectRegime({
         price: lastPrice,
         vwap: vwapNow,
@@ -498,13 +552,21 @@ async function main() {
         price: lastPrice,
         vwap: vwapNow,
         vwapSlope,
+        vwapCrossCount: null, // Not used inside scoreDirection but good to keep signature clean if needed later
+        volumeRecent: null,
+        volumeAvg: null,
         rsi: rsiNow,
         rsiSlope,
         macd,
         heikenColor: consec.color,
         heikenCount: consec.count,
-        failedVwapReclaim
+        failedVwapReclaim,
+        delta: delta1m,
+        gap, // Add gap input
+        priceToBeat // Add priceToBeat
       });
+
+
 
       const timeAware = applyTimeAwareness(scored.rawUp, timeLeftMin, CONFIG.candleWindowMinutes);
 
@@ -513,6 +575,35 @@ async function main() {
       const edge = computeEdge({ modelUp: timeAware.adjustedUp, modelDown: timeAware.adjustedDown, marketYes: marketUp, marketNo: marketDown });
 
       const rec = decide({ remainingMinutes: timeLeftMin, edgeUp: edge.edgeUp, edgeDown: edge.edgeDown, modelUp: timeAware.adjustedUp, modelDown: timeAware.adjustedDown });
+      rec.isExpired = (timeLeftMin !== null && timeLeftMin <= 0);
+      rec.strikePrice = priceToBeat;
+      rec.spotPrice = currentPrice;
+      // Pass Probability for Kelly Criterion
+      rec.probability = rec.side === "UP" ? timeAware.adjustedUp : timeAware.adjustedDown;
+      if (!Number.isFinite(rec.probability)) rec.probability = 0.5; // Fallback
+
+
+      // TIME GUARD: Block entries in the first N minutes (Volatility Filter)
+      if (timeLeftMin !== null && timeLeftMin > (15 - CONFIG.paper.timeGuardMinutes) && rec.action === "ENTER") {
+          rec.action = "HOLD";
+          rec.reason = `WAITING_VOLATILITY (< ${CONFIG.paper.timeGuardMinutes}m)`;
+      }
+
+      // END GUARD: Block entries in the last N minutes (Too Late)
+      if (timeLeftMin !== null && timeLeftMin < CONFIG.paper.entryDeadlineMinutes && rec.action === "ENTER") {
+          rec.action = "HOLD";
+          rec.reason = `TOO_LATE_TO_ENTER (< ${CONFIG.paper.entryDeadlineMinutes}m)`;
+      }
+
+      // Update Paper Trader
+      paper.update({
+          signal: scored,
+          rec,
+          prices: poly.ok ? poly.prices : { up: null, down: null },
+          market: poly.ok ? poly.market : null,
+          tokens: poly.ok ? poly.tokens : null
+      });
+      const paperPnL = paper.getUnrealizedPnL(poly.ok ? poly.prices : { up: null, down: null });
 
       const vwapSlopeLabel = vwapSlope === null ? "-" : vwapSlope > 0 ? "UP" : vwapSlope < 0 ? "DOWN" : "FLAT";
 
@@ -522,12 +613,7 @@ async function main() {
           ? (macd.histDelta !== null && macd.histDelta < 0 ? "bearish (expanding)" : "bearish")
           : (macd.histDelta !== null && macd.histDelta > 0 ? "bullish (expanding)" : "bullish");
 
-      const lastCandle = klines1m.length ? klines1m[klines1m.length - 1] : null;
-      const lastClose = lastCandle?.close ?? null;
-      const close1mAgo = klines1m.length >= 2 ? klines1m[klines1m.length - 2]?.close ?? null : null;
-      const close3mAgo = klines1m.length >= 4 ? klines1m[klines1m.length - 4]?.close ?? null : null;
-      const delta1m = lastClose !== null && close1mAgo !== null ? lastClose - close1mAgo : null;
-      const delta3m = lastClose !== null && close3mAgo !== null ? lastClose - close3mAgo : null;
+
 
       const haNarrative = (consec.color ?? "").toLowerCase() === "green" ? "LONG" : (consec.color ?? "").toLowerCase() === "red" ? "SHORT" : "NEUTRAL";
       const rsiNarrative = narrativeFromSlope(rsiSlope);
@@ -565,9 +651,34 @@ async function main() {
 
       const signal = rec.action === "ENTER" ? (rec.side === "UP" ? "BUY UP" : "BUY DOWN") : "NO TRADE";
 
-      const actionLine = rec.action === "ENTER"
-        ? `${rec.action} NOW (${rec.phase} ENTRY)`
-        : `NO TRADE (${rec.phase})`;
+      const signalColor = rec.action === "ENTER" ? (rec.side === "UP" ? ANSI.green : ANSI.red) : ANSI.gray;
+      const signalLine = rec.action === "ENTER"
+        ? `${signalColor}${rec.side === "UP" ? "▲ BUY UP" : "▼ BUY DOWN"}${ANSI.reset} (${rec.phase} ENTRY)`
+        : `${ANSI.gray}WAITING FOR EDGE...${ANSI.reset}`;
+
+      const strengthColor = rec.strength === "STRONG" ? ANSI.green : rec.strength === "GOOD" ? ANSI.yellow : ANSI.gray;
+      const edgeValue = rec.edge !== null ? formatPct(rec.edge, 1) : "0%";
+      const filled = Math.min(10, Math.max(0, Math.floor((rec.edge || 0) * 50)));
+      const convictionBar = `[${strengthColor}${"█".repeat(filled)}${ANSI.gray}${"░".repeat(10 - filled)}${ANSI.reset}]`;
+
+      const strengthLine = rec.action === "ENTER"
+        ? `${strengthColor}${rec.strength}${ANSI.reset} ${convictionBar} ${edgeValue}`
+        : "-";
+
+      let adviceLine = `${ANSI.gray}Analyzing market momentum...${ANSI.reset}`;
+      if (timeLeftMin !== null && timeLeftMin < 3) {
+        adviceLine = `${ANSI.yellow}⚠️ LATE STAGE: Volatility high. Avoid new entries.${ANSI.reset}`;
+      } else if (rec.action === "ENTER") {
+        if (signalState.lastSide && signalState.lastSide !== rec.side && (Date.now() - signalState.lastTime < 600000)) {
+          adviceLine = `${ANSI.lightRed}🚨 REVERSAL: Close previous ${signalState.lastSide} position NOW!${ANSI.reset}`;
+        } else {
+          adviceLine = rec.side === "UP" ? "Bullish edge detected. Look for entry." : "Bearish edge detected. Look for entry.";
+        }
+        signalState.lastSide = rec.side;
+        signalState.lastTime = Date.now();
+      } else if (signalState.lastSide) {
+        adviceLine = `${ANSI.gray}Previous signal (${signalState.lastSide}) weakened.${ANSI.reset}`;
+      }
 
       const spreadUp = poly.ok ? poly.orderbook.up.spread : null;
       const spreadDown = poly.ok ? poly.orderbook.down.spread : null;
@@ -577,24 +688,8 @@ async function main() {
         ? (Number(poly.market?.liquidityNum) || Number(poly.market?.liquidity) || null)
         : null;
 
-      const spotPrice = wsPrice ?? lastPrice;
-      const currentPrice = chainlink?.price ?? null;
-      const marketSlug = poly.ok ? String(poly.market?.slug ?? "") : "";
-      const marketStartMs = poly.ok && poly.market?.eventStartTime ? new Date(poly.market.eventStartTime).getTime() : null;
 
-      if (marketSlug && priceToBeatState.slug !== marketSlug) {
-        priceToBeatState = { slug: marketSlug, value: null, setAtMs: null };
-      }
 
-      if (priceToBeatState.slug && priceToBeatState.value === null && currentPrice !== null) {
-        const nowMs = Date.now();
-        const okToLatch = marketStartMs === null ? true : nowMs >= marketStartMs;
-        if (okToLatch) {
-          priceToBeatState = { slug: priceToBeatState.slug, value: Number(currentPrice), setAtMs: nowMs };
-        }
-      }
-
-      const priceToBeat = priceToBeatState.slug === marketSlug ? priceToBeatState.value : null;
       const currentPriceBaseLine = colorPriceLine({
         label: "CURRENT PRICE",
         price: currentPrice,
@@ -683,10 +778,18 @@ async function main() {
         "",
         sepLine(),
         "",
+        section("─ SIGNAL & DECISION ─"),
+        kv("SIGNAL:", signalLine),
+        kv("CONVICTION:", strengthLine),
+        kv("ADVICE:", adviceLine),
+        "",
+        sepLine(),
+        "",
         kv("POLYMARKET:", polyHeaderValue),
         liquidity !== null ? kv("Liquidity:", formatNumber(liquidity, 0)) : null,
         settlementLeftMin !== null ? kv("Time left:", `${polyTimeLeftColor}${fmtTimeLeft(settlementLeftMin)}${ANSI.reset}`) : null,
-        priceToBeat !== null ? kv("PRICE TO BEAT: ", `$${formatNumber(priceToBeat, 0)}`) : kv("PRICE TO BEAT: ", `${ANSI.gray}-${ANSI.reset}`),
+        priceToBeat !== null ? kv("STRIKE PRICE (Fixed):", `$${formatNumber(priceToBeat, 2)}`) : kv("STRIKE PRICE:", `${ANSI.gray}Waiting for start...${ANSI.reset}`),
+        kv("SPOT PRICE (Live):", `$${formatNumber(spotPrice, 2)} ${gap !== null ? `(${gap > 0 ? "+" : ""}${gap.toFixed(2)})` : ""}`),
         currentPriceLine,
         "",
         sepLine(),
@@ -696,6 +799,11 @@ async function main() {
         sepLine(),
         "",
         kv("ET | Session:", `${ANSI.white}${fmtEtTime(new Date())}${ANSI.reset} | ${ANSI.white}${getBtcSession(new Date())}${ANSI.reset}`),
+        kv("Paper Balance:", `$${formatNumber(paper.state.balance, 2)} ` + (paper.state.position
+           ? `(${paper.state.position.side} ${formatNumber(paper.state.position.shares, 1)}sh)`
+           : "(Flat)")
+           + (paperPnL !== null ? ` ${paperPnL >= 0 ? ANSI.green : ANSI.red}(PnL: ${paperPnL >= 0 ? "+" : ""}$${paperPnL.toFixed(2)})${ANSI.reset}` : "")
+        ),
         "",
         sepLine(),
         centerText(`${ANSI.dim}${ANSI.gray}created by @krajekis${ANSI.reset}`, screenWidth())
@@ -718,7 +826,11 @@ async function main() {
         marketDown,
         edge.edgeUp,
         edge.edgeDown,
-        rec.action === "ENTER" ? `${rec.side}:${rec.phase}:${rec.strength}` : "NO_TRADE"
+        rec.action === "ENTER" ? `${rec.side}:${rec.phase}:${rec.strength}` : "NO_TRADE",
+        priceToBeat,
+        lastPrice,
+        spotPrice,
+        gap
       ]);
     } catch (err) {
       console.log("────────────────────────────");
