@@ -39,14 +39,18 @@ export const CONFIG = {
     feePct: 2.0,
     takeProfitPrice: 0.95, // Legacy/Panic target (High)
     takeProfitRoiPct: 30, // Widen from ~20 to 30% (User req)
-    stopLossRoiPct: 15,   // Tighten from ~25 to 15% (User req)
+    takeProfitRoiPct: 30, 
+    stopLossRoiPct: 25,   // Tightened to 25% (was 15% but user requested widen to 25-30%)
     timeGuardMinutes: 3,
     kellyFraction: 0.25, // Quarter Kelly
     minBet: 5,
     maxBet: 10,
-    cooldownMinutes: 0, // New: 0m cooldown (Disabled by user request)
+    cooldownMinutes: 2, // New: 2m cooldown after stop loss
     entryCooldownSeconds: 60, // Cooldown after exit before re-entering
     dailyLossLimit: 10.0, // New: Max daily loss
+    maxConsecutiveLosses: 3, // New: Stop after 3 losses
+    minEntryPrice: 0.20, // New: Min price to enter
+    maxEntryPrice: 0.80, // New: Max price to enter
     stopLossGracePeriodSeconds: 60, // New: 60s grace period for Stop Loss
     entryDeadlineMinutes: 4 // End Guard (Don't enter in last 4 mins)
   }

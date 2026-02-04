@@ -19,7 +19,9 @@ export class PaperTrader {
       lastStopLossTime: 0,
       recentResults: [], // ['WIN', 'LOSS', ...]
       lastDailyReset: Date.now(),
-      lastExitTime: 0 // Track when we last closed a position
+      lastDailyReset: Date.now(),
+      lastExitTime: 0, // Track when we last closed a position
+      consecutiveLosses: 0 // New: Track streak
     };
 
     try {
@@ -259,6 +261,7 @@ export class PaperTrader {
         if (reason.includes("STOP_LOSS")) {
             this.state.lastStopLossTime = Date.now();
         }
+        this.state.consecutiveLosses = (this.state.consecutiveLosses || 0) + 1;
     } else {
         // If profit, maybe reduce daily loss? Usually "Daily Loss Limit" is "Net Loss" or "Gross Loss"?
         // Standard is Net PnL for the day. If I win $10 then lost $10, am I stopped?
@@ -270,6 +273,7 @@ export class PaperTrader {
         // So: dailyLoss -= pnl. (If pnl is positive, loss decreases. If pnl negative, loss increases).
         this.state.dailyLoss = (this.state.dailyLoss || 0) - pnl;
         this.state.recentResults = [...(this.state.recentResults || []), "WIN"].slice(-10);
+        this.state.consecutiveLosses = 0; // Reset streak
     }
 
     await this.logTrade(reason, side, exitPrice, amount, shares, pnl, marketSlug, fee);
@@ -288,9 +292,32 @@ export class PaperTrader {
     const normalizedPrice = entryPrice > 1 ? entryPrice / 100 : entryPrice;
     
     // Default Trade Amount (Manual Override fallback)
-    let tradeAmount = 10; 
+    let tradeAmount = CONFIG.paper.maxBet; 
 
     // --- FILTERS & CHECKS ---
+    
+    // 0. Price Guard (Lottery Ticket Prevention)
+    if (normalizedPrice < CONFIG.paper.minEntryPrice || normalizedPrice > CONFIG.paper.maxEntryPrice) {
+        console.log(`[Paper] Blocked Entry: Price ${normalizedPrice.toFixed(2)} out of range (${CONFIG.paper.minEntryPrice}-${CONFIG.paper.maxEntryPrice})`);
+        return;
+    }
+
+    // 0b. Consecutive Loss Circuit Breaker
+    if ((this.state.consecutiveLosses || 0) >= CONFIG.paper.maxConsecutiveLosses) {
+        console.log(`[Paper] Blocked Entry: Max consecutive losses reached (${this.state.consecutiveLosses}). Manual reset required.`);
+        return; 
+    }
+
+    // 0c. Duplicate Position Guard
+    if (this.state.position && this.state.position.marketSlug === marketSlug) {
+         // console.log(`[Paper] Blocked Entry: Already have a position in ${marketSlug}.`);
+         return;
+    }
+    
+    // Log Probability for debugging
+    if (rec) {
+       console.log(`[Probability] Model: ${rec.probability?.toFixed(2)} Market: ${normalizedPrice.toFixed(2)} Edge: ${rec.edge?.toFixed(2)} Strength: ${strength}`);
+    }
 
     // 1. Daily Loss Limit
     // User said: "below -10". So if dailyLoss > 10, we stop.
@@ -350,10 +377,7 @@ export class PaperTrader {
     
     // Let's set a 'Base Unit':
     let baseUnit = CONFIG.paper.maxBet; // 10
-    if (total >= 5 && winRate < 0.4) {
-        baseUnit = 5.0;
-        // console.log(`[Paper] Low Win Rate (${winRate.toFixed(2)}). Reducing size to $5.`);
-    }
+    // Removed dynamic sizing based on winRate < 0.4 to standardize sizing.
 
     tradeAmount = baseUnit; // Initialize with base unit 
 

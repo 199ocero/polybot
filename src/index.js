@@ -828,6 +828,30 @@ async function main() {
               : ANSI.reset)
         : ANSI.reset;
 
+      const totalEquityLine = (() => {
+        const currentPnL = paperPnL || 0;
+        const totalEquity = paper.state.balance + (paper.state.position ? currentPnL : 0);
+        const lifetimePnL = totalEquity - CONFIG.paper.initialBalance;
+        const lifetimeColor = lifetimePnL >= 0 ? ANSI.green : ANSI.red;
+        const sign = lifetimePnL >= 0 ? "+" : "-";
+        
+        return kv("Total Equity:", `$${formatNumber(totalEquity, 2)} (${lifetimeColor}${sign}$${Math.abs(lifetimePnL).toFixed(2)}${ANSI.reset})`);
+      })();
+
+      const paperBalanceLine = kv("Paper Balance:", `$${formatNumber(paper.state.balance, 2)} ` + (paper.state.position
+         ? `(${paper.state.position.side} ${formatNumber(paper.state.position.shares, 1)}sh)`
+         : "(Flat)")
+         + (paperPnL !== null ? ` ${paperPnL >= 0 ? ANSI.green : ANSI.red}(Pos PnL: ${paperPnL >= 0 ? "+" : ""}$${paperPnL.toFixed(2)})${ANSI.reset}` : "")
+      );
+
+      const dailyPnlLine = (() => {
+         const loss = paper.state.dailyLoss || 0;
+         const pnl = -loss;
+         const color = pnl >= 0 ? ANSI.green : ANSI.red;
+         const sign = pnl >= 0 ? "+" : "-";
+         return kv("Daily PnL:", `${color}${sign}$${Math.abs(pnl).toFixed(2)}${ANSI.reset} (Loss Limit: $${CONFIG.paper.dailyLossLimit})`);
+      })();
+
       const lines = [
         titleLine,
         marketLine,
@@ -848,14 +872,16 @@ async function main() {
         kv("SIGNAL:", signalLine),
         kv("CONVICTION:", strengthLine),
         kv("ADVICE:", adviceLine),
+        totalEquityLine,
+        paperBalanceLine,
+        dailyPnlLine,
         "",
         sepLine(),
         "",
         kv("POLYMARKET:", polyHeaderValue),
         liquidity !== null ? kv("Liquidity:", formatNumber(liquidity, 0)) : null,
         settlementLeftMin !== null ? kv("Time left:", `${polyTimeLeftColor}${fmtTimeLeft(settlementLeftMin)}${ANSI.reset}`) : null,
-        priceToBeat !== null ? kv("STRIKE PRICE (Fixed):", `$${formatNumber(priceToBeat, 2)}`) : kv("STRIKE PRICE:", `${ANSI.gray}Waiting for start...${ANSI.reset}`),
-        kv("SPOT PRICE (Live):", `$${formatNumber(spotPrice, 2)} ${gap !== null ? `(${gap > 0 ? "+" : ""}${gap.toFixed(2)})` : ""}`),
+        priceToBeat !== null ? kv("Price to Beat:", `$${formatNumber(priceToBeat, 2)}`) : kv("Price to Beat:", `${ANSI.gray}Waiting for start...${ANSI.reset}`),
         currentPriceLine,
         "",
         sepLine(),
@@ -865,22 +891,6 @@ async function main() {
         sepLine(),
         "",
         kv("ET | Session:", `${ANSI.white}${fmtEtTime(new Date())}${ANSI.reset} | ${ANSI.white}${getBtcSession(new Date())}${ANSI.reset}`),
-        (() => {
-            const currentPnL = paperPnL || 0;
-            const totalEquity = paper.state.balance + (paper.state.position ? currentPnL : 0);
-            const lifetimePnL = totalEquity - CONFIG.paper.initialBalance;
-            const lifetimeColor = lifetimePnL >= 0 ? ANSI.green : ANSI.red;
-            const sign = lifetimePnL >= 0 ? "+" : "-";
-            
-            return kv("Total Equity:", `$${formatNumber(totalEquity, 2)} (${lifetimeColor}${sign}$${Math.abs(lifetimePnL).toFixed(2)}${ANSI.reset})`);
-        })(),
-        kv("Paper Balance:", `$${formatNumber(paper.state.balance, 2)} ` + (paper.state.position
-           ? `(${paper.state.position.side} ${formatNumber(paper.state.position.shares, 1)}sh)`
-           : "(Flat)")
-           + (paperPnL !== null ? ` ${paperPnL >= 0 ? ANSI.green : ANSI.red}(Pos PnL: ${paperPnL >= 0 ? "+" : ""}$${paperPnL.toFixed(2)})${ANSI.reset}` : "")
-        ),
-        kv("BTC Trend (5m):", trendLabel === "RISING" ? `${ANSI.green}RISING${ANSI.reset}` : `${ANSI.red}FALLING${ANSI.reset}`),
-        kv("Daily Net Loss:", `$${(paper.state.dailyLoss || 0).toFixed(2)} / $${CONFIG.paper.dailyLossLimit}`),
         "",
         sepLine(),
         centerText(`${ANSI.dim}${ANSI.gray}created by @krajekis${ANSI.reset}`, screenWidth())
