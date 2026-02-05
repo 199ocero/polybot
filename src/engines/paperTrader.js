@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { CONFIG } from "../config.js";
 import { logPaperTradeToDb } from "../db.js";
+import { sendDiscordNotification } from "../net/discord.js";
 
 const STATE_FILE = "./src/state/paperState.json";
 
@@ -14,13 +15,14 @@ export class PaperTrader {
   loadState() {
     const defaultState = {
       balance: CONFIG.paper.initialBalance,
-      position: null, // { side: 'UP'|'DOWN', amount: 10, entryPrice: 0.50, shares: 20, marketSlug: '...' }
+      positions: [], // Array of { side, amount, entryPrice, shares, marketSlug, entryTime, hitBreakevenTrigger }
       dailyLoss: 0,
       lastStopLossTime: 0,
       recentResults: [], // ['WIN', 'LOSS', ...]
       lastDailyReset: Date.now(),
       lastDailyReset: Date.now(),
-      lastExitTime: 0, // Track when we last closed a position
+      lastExitTime: 0,
+      lastEntryTime: 0, // Track when we last opened a position
       consecutiveLosses: 0 // New: Track streak
     };
 
@@ -102,148 +104,109 @@ export class PaperTrader {
   }
 
   async checkExitConditions(market, prices, { timeLeftMin } = {}) {
-    if (!this.state.position) return;
-    if (this.state.position.marketSlug !== market.slug) return;
+    if (!this.state.positions || this.state.positions.length === 0) return;
 
-    // 1. TIME GUARD (Late Game)
-    // If < 2 mins left, we HOLD everything to expiry.
-    // - TP: Don't sell winning bags at discount.
-    // - SL: Don't panic sell at bottom. Volume likely thin.
-    if (timeLeftMin !== undefined && timeLeftMin < 2) {
-        return; 
-    }
-
-    const { side, entryPrice } = this.state.position;
-    const price = side === "UP" ? prices.up : prices.down;
+    // Use a copy to iterate because we might remove items
+    const activePositions = [...this.state.positions];
     
-    // SAFETY: If price is missing (null/undefined), do nothing.
-    if (price === null || price === undefined) return;
+    for (const pos of activePositions) {
+        if (pos.marketSlug !== market.slug) continue;
 
-    // Normalize logic
-    const isCents = price > 1.5; 
-    const normPrice = isCents ? price / 100 : price;
-    
-    // Calculate ROI
-    // ROI = (Current - Entry) / Entry
-    if (!entryPrice) return;
-    const roi = (normPrice - entryPrice) / entryPrice;
-    const roiPct = roi * 100;
+        const { side, entryPrice, entryTime } = pos;
+        const price = side === "UP" ? prices.up : prices.down;
+        
+        if (price === null || price === undefined) continue;
 
-    const tpRoi = CONFIG.paper.takeProfitRoiPct; // e.g. 20
-    const slRoi = CONFIG.paper.stopLossRoiPct;   // e.g. 25
-    
-    // A. TAKE PROFIT (ROI)
-    if (roiPct >= tpRoi) {
-       // Hybrid Guard: 
-       // If signal is VERY STRONG (> 0.75), hold for max profit ($0.95/$1.00).
-       // If signal is just "Winning" (0.50 - 0.75), secure the profit now (volatility protection).
-       if (normPrice > 0.75) {
-           return; 
-       }
+        const normPrice = price > 1.05 ? price / 100 : price;
+        const roi = (normPrice - entryPrice) / entryPrice;
+        const roiPct = roi * 100;
 
-       // Optional: Ensure we cover fees?
-       // Fee is ~4% round trip. If TP is 20%, we are fine.
-       await this.closePosition(price, `TAKE_PROFIT_ROI (+${roiPct.toFixed(1)}%)`);
-       return;
-    }
+        // 0. BREAKEVEN TRIGGER
+        if (roiPct >= 30 && !pos.hitBreakevenTrigger) {
+            pos.hitBreakevenTrigger = true;
+            this.saveState();
+            console.log(`[Paper] Breakeven Triggered (+${roiPct.toFixed(1)}%). Stop Loss moved to Entry: ${entryPrice.toFixed(2)}`);
+        }
 
-    // B. STOP LOSS
-    // Check Grace Period
-    const entryTime = this.state.position.entryTime || 0;
-    const secondsSinceEntry = (Date.now() - entryTime) / 1000;
-    const gracePeriod = CONFIG.paper.stopLossGracePeriodSeconds || 0;
+        const slRoi = CONFIG.paper.stopLossRoiPct;
+        const entryAgeSeconds = (Date.now() - entryTime) / 1000;
+        const gracePeriod = CONFIG.paper.stopLossGracePeriodSeconds || 0;
 
-    if (roiPct <= -slRoi) {
-       // Favor Guard: If price > 0.50, don't stop loss.
-       if (normPrice > 0.50) {
-           return; 
-       }
+        // 1. HARD STOP LOSS
+        if (roiPct <= -slRoi) {
+           if (entryAgeSeconds < gracePeriod) continue;
 
-       if (secondsSinceEntry < gracePeriod) {
-           // console.log(`[Paper] Stop Loss HIT but ignored (Grace Period: ${secondsSinceEntry.toFixed(0)}s < ${gracePeriod}s)`);
-           return;
-       }
-       await this.closePosition(price, `STOP_LOSS (${roiPct.toFixed(1)}%)`);
-       return;
-    }
-    
-    // C. Legacy High Price Target (0.95)
-    // If price shoots to 0.95 instantly, logic A caches it (ROI is huge). 
-    // So distinct check not strictly needed unless Entry was 0.80 (ROI < 20%).
-    if (normPrice >= CONFIG.paper.takeProfitPrice) {
-        await this.closePosition(price, "TAKE_PROFIT_HIGH");
-        return;
+           if (pos.hitBreakevenTrigger && roiPct < 0) {
+               await this.closePosition(pos, entryPrice, `STOP_LOSS_BREAKEVEN (Locked Entry)`);
+               continue;
+           }
+
+           await this.closePosition(pos, price, `STOP_LOSS (${roiPct.toFixed(1)}%)`);
+           continue;
+        }
+
+        // Breakeven protection
+        if (pos.hitBreakevenTrigger && roiPct <= 0) {
+            await this.closePosition(pos, entryPrice, `STOP_LOSS_BREAKEVEN (Protection)`);
+            continue;
+        }
+
+        // 2. HALF-TIME RULE
+        if (timeLeftMin !== undefined && timeLeftMin <= 7.5 && roiPct < 0) {
+            await this.closePosition(pos, price, `HALF_TIME_EXIT (${roiPct.toFixed(1)}%)`);
+            continue;
+        }
+
+        // 3. EARLY EXIT
+        if (normPrice >= 0.92) {
+            await this.closePosition(pos, price, `TAKE_PROFIT_92 (Lock Win)`);
+            continue;
+        }
+        if (roiPct >= 80) {
+            await this.closePosition(pos, price, `TAKE_PROFIT_ROI_80 (+${roiPct.toFixed(1)}%)`);
+            continue;
+        }
     }
   }
 
   async checkResolution(market, prices, { isExpired, strikePrice, spotPrice } = {}) {
-    if (!this.state.position) return;
-    
-    // Safety: If market changed, maybe force close?
-    // But better to handle expiration explicitly.
-    // If the tracked market is different from current, and we haven't settled, 
-    // we might be orphaned. Ideally we catch it on the tick OF expiration.
+    if (!this.state.positions || this.state.positions.length === 0) return;
 
-    if (this.state.position.marketSlug !== market.slug) {
-        // We switched markets. The old one is gone from 'market' obj.
-        // We can't really settle accurately unless we stored the old strike.
-        // For now, let's rely on 'isExpired' flag passed just before the switch ideally.
-        return; 
-    }
-
-    // A. TIME EXPIRY SETTLEMENT
     if (isExpired && strikePrice !== null && spotPrice !== null) {
-      const side = this.state.position.side;
-      let win = false;
-      
-      // Polymarket Rules: 
-      // UP = Spot >= Strike
-      // DOWN = Spot < Strike
-      if (side === "UP") win = spotPrice >= strikePrice;
-      else if (side === "DOWN") win = spotPrice < strikePrice;
-      
-      await this.closePosition(win ? 1 : 0, `EXPIRY (Spot: ${spotPrice}, Strike: ${strikePrice})`);
-      return;
+      const activePositions = [...this.state.positions];
+      for (const pos of activePositions) {
+        if (pos.marketSlug !== market.slug) continue;
+        const side = pos.side;
+        let win = false;
+        if (side === "UP") win = spotPrice >= strikePrice;
+        else if (side === "DOWN") win = spotPrice < strikePrice;
+        
+        await this.closePosition(pos, win ? 1 : 0, `EXPIRY (Spot: ${spotPrice}, Strike: ${strikePrice})`);
+      }
     }
-
-    // B. EARLY SETTLEMENT REMOVED
-    // User requested to wait until time expiry (0) even if price hits 0 or 100.
-    // This allows for potential recovery from near-zero prices.
   }
 
   getUnrealizedPnL(prices) {
-    if (!this.state.position) return null;
-    const { side, shares, entryPrice, amount, marketSlug } = this.state.position;
+    if (!this.state.positions || this.state.positions.length === 0) return 0;
     
-    // Current Price
-    let currentPrice = side === "UP" ? prices.up : prices.down;
-    if (currentPrice === null || currentPrice === undefined) return 0;
-    
-    // Normalize current price to match entryPrice scale (DOLLARS)
-    // If entryPrice was stored as normalized (0.57), and currentPrice is 57, we divide.
-    // In handleEntrySignal we did: `const normalizedPrice = entryPrice > 1 ? entryPrice / 100 : entryPrice;`
-    // So entryPrice is ALWAYS 0-1.
-    
-    const normalizedCurr = currentPrice > 1.05 ? currentPrice / 100 : currentPrice;
-    
-    const currentValue = shares * normalizedCurr;
-    return currentValue - amount;
+    let totalPnl = 0;
+    for (const pos of this.state.positions) {
+        let currentPrice = pos.side === "UP" ? prices.up : prices.down;
+        if (currentPrice === null || currentPrice === undefined) continue;
+        
+        const normalizedCurr = currentPrice > 1.05 ? currentPrice / 100 : currentPrice;
+        const currentValue = pos.shares * normalizedCurr;
+        totalPnl += (currentValue - pos.amount);
+    }
+    return totalPnl;
   }
 
-  async closePosition(exitPrice, reason) {
-    if (!this.state.position) return;
-    const { side, shares, amount, marketSlug } = this.state.position;
+  async closePosition(pos, exitPrice, reason) {
+    const { side, shares, amount, marketSlug } = pos;
     
     const normalizedExit = exitPrice > 1.05 ? exitPrice / 100 : exitPrice;
     let proceeds = shares * normalizedExit;
     
-    // Apply Exit Fee (except for Expiry Settlement which is usually free/rebated? 
-    // Actually standard rule: taker fee applies to "matched" orders. EXPIRY is settlement, usually 0 fee.
-    // So if reason === 'EXPIRY' or 'SETTLE' (100/0), maybe no fee?
-    // User asked to simulate fees. Standard is fee on trade. Settlement is redemption.
-    // Redemption is free.
-    // So ONLY apply fee if we are SELLING (Flip, TP).
-
     let fee = 0;
     if (reason !== "EXPIRY" && reason !== "SETTLE") {
         fee = proceeds * (CONFIG.paper.feePct / 100);
@@ -251,10 +214,8 @@ export class PaperTrader {
     }
 
     const pnl = proceeds - amount;
-    
     this.state.balance += proceeds;
     
-    // Track Metrics
     if (pnl < 0) {
         this.state.dailyLoss = (this.state.dailyLoss || 0) + Math.abs(pnl);
         this.state.recentResults = [...(this.state.recentResults || []), "LOSS"].slice(-10);
@@ -263,22 +224,33 @@ export class PaperTrader {
         }
         this.state.consecutiveLosses = (this.state.consecutiveLosses || 0) + 1;
     } else {
-        // If profit, maybe reduce daily loss? Usually "Daily Loss Limit" is "Net Loss" or "Gross Loss"?
-        // Standard is Net PnL for the day. If I win $10 then lost $10, am I stopped?
-        // User said: "Daily Loss Limit = 10.0 ... Stop trading after $10 loss". Usually means Net PnL < -10.
-        // But let's track Net Daily PnL.
-        // Actually, user said "daily_pnl < -DAILY_LOSS_LIMIT". So it IS Net PnL.
-        // So I should subtract PnL from a "Daily PnL" counter.
-        // Let's refactor: I defined `dailyLoss` as a positive number representing loss.
-        // So: dailyLoss -= pnl. (If pnl is positive, loss decreases. If pnl negative, loss increases).
         this.state.dailyLoss = (this.state.dailyLoss || 0) - pnl;
         this.state.recentResults = [...(this.state.recentResults || []), "WIN"].slice(-10);
-        this.state.consecutiveLosses = 0; // Reset streak
+        this.state.consecutiveLosses = 0;
     }
 
     await this.logTrade(reason, side, exitPrice, amount, shares, pnl, marketSlug, fee);
-    this.state.position = null;
+
+    sendDiscordNotification({
+      type: pnl >= 0 ? "WIN" : "LOSS",
+      side,
+      price: exitPrice,
+      shares,
+      pnl,
+      balance: this.state.balance,
+      marketSlug,
+      reason,
+      amount: proceeds,
+      fee
+    });
+
+    // Remove from array
+    this.state.positions = this.state.positions.filter(p => p !== pos);
+    
+    // For Penalty Box: Reverted as it backfired (Phase 7). 
+    // We now rely on Max Concurrent = 2 to limit damage.
     this.state.lastExitTime = Date.now();
+
     this.saveState();
     console.log(`[Paper] Closed ${side} at ${exitPrice} (${reason}). PnL: $${pnl.toFixed(2)} (Fee: $${fee.toFixed(2)}) DailyNetLoss: $${this.state.dailyLoss.toFixed(2)}`);
   }
@@ -337,14 +309,12 @@ export class PaperTrader {
         }
     }
 
-    // 2b. Cooldown after Any Exit
-    if (this.state.lastExitTime) {
-        const msSinceExit = Date.now() - this.state.lastExitTime;
-        const secondsSinceExit = msSinceExit / 1000;
-        const cooldownSec = CONFIG.paper.entryCooldownSeconds || 60;
-        
-        if (secondsSinceExit < cooldownSec) {
-            // console.log(`[Paper] Exit Cooldown active (${secondsSinceExit.toFixed(0)}s < ${cooldownSec}s)`);
+    // 2b. Entry Debounce (15 Seconds)
+    if (this.state.lastEntryTime) {
+        const msSinceEntry = Date.now() - this.state.lastEntryTime;
+        const entryDebounceMs = (CONFIG.paper.entryCooldownSeconds || 15) * 1000;
+        if (msSinceEntry < entryDebounceMs) {
+            // console.log(`[Paper] Entry Debounce active (${(msSinceEntry/1000).toFixed(0)}s < ${CONFIG.paper.entryCooldownSeconds}s)`);
             return;
         }
     }
@@ -422,51 +392,50 @@ export class PaperTrader {
     } 
 
     // FLIP FLOP LOGIC (Reversal)
-    if (currentPos) {
-      if (currentPos.side !== side && currentPos.marketSlug === marketSlug) {
-        // Favor Guard: If we are holding a winning position (> 0.50), don't flip.
-        const heldPrice = currentPos.side === "UP" ? priceUp : priceDown;
-        const normHeldPrice = heldPrice > 1 ? heldPrice / 100 : heldPrice;
-        
-        if (normHeldPrice > 0.50) {
-            console.log(`[Paper] Flip Blocked: Holding ${currentPos.side} at ${normHeldPrice.toFixed(2)} (> 0.50). Ignoring ${side} signal.`);
-            return;
+    const marketPositions = this.state.positions.filter(p => p.marketSlug === marketSlug);
+    if (marketPositions.length > 0) {
+      if (marketPositions[0].side !== side) {
+        console.log(`[Paper] FLIPPING POSITIONS: ${marketPositions[0].side} -> ${side}`);
+        for (const pos of marketPositions) {
+            await this.closePosition(pos, (side === "UP" ? priceUp : priceDown), "FLIP_CLOSE");
         }
-
-        // REVERSE: Close current, Open new
-        console.log(`[Paper] FLIPPING POSITION: ${currentPos.side} -> ${side}`);
-        
-        // 1. Sell Current
-        await this.closePosition((currentPos.side === "UP" ? priceUp : priceDown), "FLIP_CLOSE"); 
-
-        // 2. Open New
-        // Proceed to open logic below
-      } else {
-        // Same side? Hold.
-        // Optional: pyamid (add more) if Strong? For now, simple HOLD.
-        return; 
       }
     }
 
-    // OPEN NEW POSITION
-    if (!this.state.position && this.state.balance >= tradeAmount) {
+    // OPEN NEW POSITION (Balanced Stacking - Power of 2)
+    const maxPos = CONFIG.paper.maxConcurrentPositions || 2;
+    if (this.state.positions.length < maxPos && this.state.balance >= tradeAmount) {
        const shares = tradeAmount / normalizedPrice;
-       
-       // Apply Entry Fee
        const fee = tradeAmount * (CONFIG.paper.feePct / 100);
        const totalCost = tradeAmount + fee;
 
        this.state.balance -= totalCost;
-       this.state.position = {
+       this.state.positions.push({
          marketSlug,
          side,
          entryPrice: normalizedPrice,
-         amount: totalCost, // Cost basis includes fee for PnL
+         amount: totalCost,
          shares,
-         entryTime: Date.now() // Capture Entry Time for Grace Period
-       };
+         entryTime: Date.now(),
+         hitBreakevenTrigger: false
+       });
+       
+       this.state.lastEntryTime = Date.now(); // Track entry for debounce
        
        await this.logTrade("OPEN", side, entryPrice, tradeAmount, shares, null, marketSlug, fee);
+       
+       // Discord Notification
+       sendDiscordNotification({
+         type: "OPEN",
+         side,
+         price: entryPrice,
+         shares,
+         amount: tradeAmount, // Cost
+         balance: this.state.balance,
+         marketSlug,
+         fee
+       });
+
        this.saveState();
        console.log(`[Paper] Entered ${side} at ${entryPrice} (Amt: $${tradeAmount} + Fee: $${fee.toFixed(2)})`);
     } else if (this.state.balance < tradeAmount) {
@@ -479,26 +448,17 @@ export class PaperTrader {
       return "Daily Loss Limit";
     }
 
-    // 2. Cooldown after Stop Loss
-    if (this.state.lastStopLossTime) {
-      const msSince = Date.now() - this.state.lastStopLossTime;
-      const minsSince = msSince / 60000;
-      if (minsSince < CONFIG.paper.cooldownMinutes) {
-        const remaining = Math.ceil(CONFIG.paper.cooldownMinutes - minsSince);
-        return `Cooldown (${remaining}m)`;
-      }
-    }
+    // 2. Penalty Box / Cooldown Logic: Reverted in Phase 7 to prioritize recovery trades.
+    // We strictly use the 15s entry debounce (below) and max 2 positions.
 
-    // 2b. Cooldown after Any Exit (User Request)
-    if (this.state.lastExitTime) {
-      const msSinceExit = Date.now() - this.state.lastExitTime;
-      const secondsSinceExit = msSinceExit / 1000;
-      const cooldownSec = CONFIG.paper.entryCooldownSeconds || 60;
-      
-      if (secondsSinceExit < cooldownSec) {
-        const remaining = Math.ceil(cooldownSec - secondsSinceExit);
-        return `Exit Cooldown (${remaining}s)`;
-      }
+    // 2b. Entry Debounce (15 Seconds)
+    if (this.state.lastEntryTime) {
+        const msSinceEntry = Date.now() - this.state.lastEntryTime;
+        const entryDebounceMs = (CONFIG.paper.entryCooldownSeconds || 15) * 1000;
+        if (msSinceEntry < entryDebounceMs) {
+            const remaining = Math.ceil((entryDebounceMs - msSinceEntry) / 1000);
+            return `Entry Debounce (${remaining}s)`;
+        }
     }
 
     // 3. Trend Filter

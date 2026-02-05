@@ -1,12 +1,13 @@
 {
-  "name": "polyassistent",
+  "name": "polybot",
   "version": "0.1.0",
   "type": "module",
   "private": true,
   "scripts": {
-    "start": "node --expose-gc --max-old-space-size=4096 src/index.js"
+    "start": "node -r dotenv/config --expose-gc --max-old-space-size=4096 src/index.js"
   },
   "dependencies": {
+    "dotenv": "^17.2.3",
     "ethers": "^6.11.1",
     "https-proxy-agent": "^7.0.6",
     "socks-proxy-agent": "^8.0.5",

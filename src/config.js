@@ -39,19 +39,24 @@ export const CONFIG = {
     feePct: 2.0,
     takeProfitPrice: 0.95, // Legacy/Panic target (High)
     takeProfitRoiPct: 30, // Widen from ~20 to 30% (User req)
-    takeProfitRoiPct: 30, 
-    stopLossRoiPct: 25,   // Tightened to 25% (was 15% but user requested widen to 25-30%)
+
+    stopLossRoiPct: 20,   // Tightened to 20% (was 35%) per analysis recommendation
     timeGuardMinutes: 3,
     kellyFraction: 0.25, // Quarter Kelly
     minBet: 5,
     maxBet: 10,
     cooldownMinutes: 2, // New: 2m cooldown after stop loss
-    entryCooldownSeconds: 60, // Cooldown after exit before re-entering
-    dailyLossLimit: 10.0, // New: Max daily loss
-    maxConsecutiveLosses: 3, // New: Stop after 3 losses
-    minEntryPrice: 0.20, // New: Min price to enter
-    maxEntryPrice: 0.80, // New: Max price to enter
-    stopLossGracePeriodSeconds: 60, // New: 60s grace period for Stop Loss
+    entryCooldownSeconds: 15, // Reduced to 15s (Micro-debounce)
+    maxConcurrentPositions: 2, // The Power of 2: Balanced approach
+    penaltyBoxCooldownSeconds: 300, // 5 Minutes for Hard Losses
+    dailyLossLimit: 100.0, // Increased to 100 (was 10)daily loss
+    maxConsecutiveLosses: Number(process.env.PAPER_MAX_CONSECUTIVE_LOSSES) || 5, // New: Stop after N losses
+    minEntryPrice: 0.40, // New: Min price (Drift hunting $0.40-$0.60)
+    maxEntryPrice: 0.60, // New: Max price
+    stopLossGracePeriodSeconds: 15, // New: 15s grace period (was 60s) for Stop Loss
     entryDeadlineMinutes: 4 // End Guard (Don't enter in last 4 mins)
+  },
+  discord: {
+    webhookUrl: process.env.DISCORD_WEBHOOK_URL || ""
   }
 };

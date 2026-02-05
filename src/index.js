@@ -17,6 +17,7 @@ import { computeSessionVwap, computeVwapSeries } from "./indicators/vwap.js";
 import { computeRsi, sma, slopeLast } from "./indicators/rsi.js";
 import { computeMacd } from "./indicators/macd.js";
 import { computeHeikenAshi, countConsecutive } from "./indicators/heikenAshi.js";
+import { computeEma } from "./indicators/ema.js";
 import { detectRegime } from "./engines/regime.js";
 import { scoreDirection, applyTimeAwareness } from "./engines/probability.js";
 import { computeEdge, decide } from "./engines/edge.js";
@@ -538,6 +539,12 @@ async function main() {
       const consec = countConsecutive(ha);
 
       const vwapCrossCount = countVwapCrosses(closes, vwapSeries, 20);
+      
+      // Calculate 5-minute EMA (based on 1m candles)
+      const ema5 = computeEma(closes, 5); 
+      const lastPriceForEma = spotPrice ?? lastPrice;
+      const emaTrend = ema5 !== null ? (lastPriceForEma > ema5 ? "UP" : "DOWN") : "NEUTRAL";
+
       const volumeRecent = candles.slice(-20).reduce((a, c) => a + c.volume, 0);
       const volumeAvg = candles.slice(-120).reduce((a, c) => a + c.volume, 0) / 6;
 
@@ -643,12 +650,8 @@ async function main() {
           prices: poly.ok ? poly.prices : { up: null, down: null },
           market: poly.ok ? poly.market : null,
           tokens: poly.ok ? poly.tokens : null,
-          trend: (() => {
-               if (closes.length < 6) return "FLAT";
-               const cNow = closes[closes.length - 1];
-               const cPast = closes[closes.length - 6]; // 5 mins ago
-               return cNow > cPast ? "RISING" : "FALLING";
-          })()
+          trend: emaTrend, // Using EMA Trend (Momentum Filter)
+          timeLeftMin // Pass timeLeftMin for Half-Time rule
       });
       const paperPnL = paper.getUnrealizedPnL(poly.ok ? poly.prices : { up: null, down: null });
 
@@ -703,7 +706,10 @@ async function main() {
       const vwapValue = `${formatNumber(vwapNow, 0)} (${formatPct(vwapDist, 2)}) | slope: ${vwapSlopeLabel}`;
       const vwapLine = formatNarrativeValue("VWAP", vwapValue, vwapNarrative);
 
-      const blockingReason = rec.action === "ENTER" ? paper.getBlockingReason(rec.side, trendLabel) : null;
+      const emaLabel = ema5 !== null ? `${formatNumber(ema5, 0)} (${emaTrend})` : "-";
+      const emaLine = formatNarrativeValue("EMA(5)", emaLabel, emaTrend === "UP" ? "LONG" : emaTrend === "DOWN" ? "SHORT" : "NEUTRAL");
+
+      const blockingReason = rec.action === "ENTER" ? paper.getBlockingReason(rec.side, emaTrend) : null;
       
       const signal = rec.action === "ENTER" ? (rec.side === "UP" ? "BUY UP" : "BUY DOWN") : "NO TRADE";
 
